@@ -2,18 +2,20 @@
 """
 AMC ticket-drop watcher.
 
-Polls a public AMC showtimes page and sends you an SMS (via Twilio) the moment
-a specific movie + premium format (e.g. "The Odyssey" in IMAX 70mm) shows up
-with bookable showtimes.
+Polls a public AMC showtimes page and emails/texts you the moment a specific
+movie + premium format (e.g. "The Odyssey" in IMAX 70mm) shows up with
+bookable showtimes. Notifications are sent via Gmail SMTP - to your real email
+address, and optionally to your phone's free carrier email-to-SMS gateway
+(e.g. 5551234567@txt.att.net) so it also arrives as a text, at no cost.
 
 This ONLY reads the public showtimes page - it does not log in, does not touch
 checkout/payment, and does not attempt to purchase tickets. See README.md for
 context on why (AMC's Terms of Use prohibit automated purchasing).
 
 Usage:
-    python watcher.py                 # run the poller loop forever
-    python watcher.py --once          # check one time and print the result, then exit
-    python watcher.py --send-test-sms # send a test SMS to confirm Twilio is wired up
+    python watcher.py                   # run the poller loop forever
+    python watcher.py --once            # check one time and print the result, then exit
+    python watcher.py --send-test-email # send a test notification to confirm SMTP is wired up
 
 Configuration is done via environment variables - see .env.example.
 """
@@ -25,7 +27,9 @@ import json
 import time
 import random
 import logging
+import smtplib
 import argparse
+from email.mime.text import MIMEText
 from datetime import datetime, timezone
 
 import requests
@@ -62,10 +66,17 @@ FAILURE_ALERT_COOLDOWN_SECONDS = int(os.environ.get("FAILURE_ALERT_COOLDOWN_SECO
 
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
-TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "")
-NOTIFY_TO_NUMBER = os.environ.get("NOTIFY_TO_NUMBER", "")
+# --- Notifications (Gmail SMTP) ---
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
+GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+# Comma-separated list of destination addresses. Include both a real email and
+# a carrier email-to-SMS gateway address (e.g. 6507399807@txt.att.net) to get
+# a free text-like alert alongside the email.
+NOTIFY_EMAILS = [
+    e.strip() for e in os.environ.get("NOTIFY_EMAILS", "").split(",") if e.strip()
+]
 
 USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -161,28 +172,30 @@ def check_availability(html):
 
 
 # --------------------------------------------------------------------------
-# SMS via Twilio REST API (plain HTTP call, no twilio SDK dependency)
+# Notifications via Gmail SMTP (also reaches carrier email-to-SMS gateways)
 # --------------------------------------------------------------------------
 
-def send_sms(body):
-    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER, NOTIFY_TO_NUMBER]):
-        log.error("Twilio is not fully configured - cannot send SMS. Message was: %s", body)
+def send_notification(subject, body):
+    if not all([GMAIL_ADDRESS, GMAIL_APP_PASSWORD]) or not NOTIFY_EMAILS:
+        log.error(
+            "Email is not fully configured - cannot send notification. Subject was: %s", subject
+        )
         return False
-
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
-    data = {"From": TWILIO_FROM_NUMBER, "To": NOTIFY_TO_NUMBER, "Body": body}
 
     for attempt in range(3):
         try:
-            resp = requests.post(
-                url, data=data, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=15
-            )
-            if resp.status_code in (200, 201):
-                log.info("SMS sent: %s", body[:80])
-                return True
-            log.error("Twilio error %s: %s", resp.status_code, resp.text[:300])
-        except requests.RequestException as e:
-            log.error("Twilio request failed (attempt %d): %s", attempt + 1, e)
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+                server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+                for to_addr in NOTIFY_EMAILS:
+                    msg = MIMEText(body)
+                    msg["Subject"] = subject
+                    msg["From"] = GMAIL_ADDRESS
+                    msg["To"] = to_addr
+                    server.sendmail(GMAIL_ADDRESS, [to_addr], msg.as_string())
+            log.info("Notification sent to %s: %s", NOTIFY_EMAILS, subject)
+            return True
+        except (smtplib.SMTPException, OSError) as e:
+            log.error("SMTP send failed (attempt %d): %s", attempt + 1, e)
         time.sleep(2 * (attempt + 1))
     return False
 
@@ -194,10 +207,12 @@ def send_sms(body):
 def build_available_message(result):
     times_str = ", ".join(result["times"]) if result["times"] else "see page for times"
     warn = " Some already show Almost Full!" if result["almost_full_count"] else ""
-    return (
-        f"🎬 {FORMAT_DISPLAY_NAME} tickets for {MOVIE_DISPLAY_NAME} are LIVE at "
+    subject = f"🎬 {FORMAT_DISPLAY_NAME} tickets for {MOVIE_DISPLAY_NAME} are LIVE!"
+    body = (
+        f"{FORMAT_DISPLAY_NAME} tickets for {MOVIE_DISPLAY_NAME} are LIVE at "
         f"{THEATRE_SLUG}! Times: {times_str}.{warn} Buy now: {THEATRE_URL}"
     )
+    return subject, body
 
 
 def run_once():
@@ -209,10 +224,10 @@ def run_once():
 
 
 def run_loop():
-    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER, NOTIFY_TO_NUMBER]):
+    if not all([GMAIL_ADDRESS, GMAIL_APP_PASSWORD]) or not NOTIFY_EMAILS:
         log.warning(
-            "Twilio env vars are not fully set - the watcher will run and log status, "
-            "but will NOT be able to send SMS alerts until configured."
+            "Email env vars are not fully set - the watcher will run and log status, "
+            "but will NOT be able to send notifications until configured."
         )
 
     state = load_state()
@@ -244,7 +259,8 @@ def run_loop():
                     )
                 )
                 if should_notify:
-                    if send_sms(build_available_message(result)):
+                    subject, body = build_available_message(result)
+                    if send_notification(subject, body):
                         state["notified"] = True
                         state["notify_count"] += 1
                         state["last_notified_ts"] = now
@@ -264,9 +280,10 @@ def run_loop():
                 state["consecutive_failures"] >= FAILURE_ALERT_THRESHOLD
                 and time.time() - state["last_failure_alert_ts"] >= FAILURE_ALERT_COOLDOWN_SECONDS
             ):
-                send_sms(
-                    f"⚠️ AMC ticket watcher has failed to reach the showtimes page "
-                    f"{state['consecutive_failures']} times in a row. Check the logs/host."
+                send_notification(
+                    "⚠️ AMC ticket watcher is failing",
+                    f"The watcher has failed to reach the showtimes page "
+                    f"{state['consecutive_failures']} times in a row. Check the logs/host.",
                 )
                 state["last_failure_alert_ts"] = time.time()
 
@@ -280,12 +297,15 @@ def run_loop():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true", help="Check once, print result, and exit")
-    parser.add_argument("--send-test-sms", action="store_true", help="Send a test SMS and exit")
+    parser.add_argument(
+        "--send-test-email", action="store_true", help="Send a test notification and exit"
+    )
     args = parser.parse_args()
 
-    if args.send_test_sms:
-        ok = send_sms(
-            f"Test message from your AMC ticket watcher at {datetime.now(timezone.utc).isoformat()}"
+    if args.send_test_email:
+        ok = send_notification(
+            "AMC ticket watcher - test",
+            f"Test message from your AMC ticket watcher at {datetime.now(timezone.utc).isoformat()}",
         )
         sys.exit(0 if ok else 1)
 
