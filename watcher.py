@@ -162,7 +162,12 @@ def check_availability(html):
     times, almost_full = ([], 0)
     if available:
         times, almost_full = extract_times_near(html, idx)
-    movie_present = MOVIE_SLUG in html
+    # Note: MOVIE_SLUG alone (without the id="..." prefix) can also match unrelated
+    # mentions elsewhere on the page, e.g. a "coming soon" promo widget listing every
+    # movie at the theatre regardless of date. Requiring the id="<movie>-<theatre>"
+    # prefix means the movie actually has a rendered showtimes region for this date,
+    # in *some* format (even if not yet the one we're watching for).
+    movie_present = f'id="{MOVIE_SLUG}-{THEATRE_SLUG}' in html
     return {
         "available": available,
         "movie_present_at_all": movie_present,
