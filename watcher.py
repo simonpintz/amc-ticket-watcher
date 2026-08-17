@@ -42,16 +42,37 @@ except ImportError:
 
 # --------------------------------------------------------------------------
 # Configuration
+#
+# TODO(new movie/theatre/format): everything below is driven by environment
+# variables, so watching something new is normally just a case of setting new
+# env vars (in .env locally, or Railway's Variables tab in prod) - no code
+# changes needed. The values below are only the *defaults* used when a var
+# isn't set. To find the right values for a new movie/theatre/format combo:
+#   1. Open the AMC showtimes page for that theatre on a date the movie you
+#      want IS already on sale (any format), e.g.
+#      https://www.amctheatres.com/movie-theatres/<market>/<theatre-slug>/showtimes?date=YYYY-MM-DD
+#   2. View page source (not devtools-rendered DOM - use curl or "view source")
+#      and search for `-attributes"`. You'll find ids shaped like:
+#      id="<movie-slug>-<theatre-slug>-<format-key>-0-attributes"
+#   3. Pull MOVIE_SLUG, THEATRE_SLUG, and FORMAT_KEY straight out of that id.
+#      FORMAT_KEY is whatever appears right before "-0-attributes" (e.g.
+#      imax70mm, imax, dolbycinemaatamcprime, 70mm, laser, standard).
 # --------------------------------------------------------------------------
 
+# TODO: change to the target theatre's showtimes URL + target date.
 THEATRE_URL = os.environ.get(
     "THEATRE_URL",
     "https://www.amctheatres.com/movie-theatres/new-york-city/amc-lincoln-square-13/showtimes?date=2026-09-14",
 )
+# TODO: change to the new movie's slug (see lookup steps above).
 MOVIE_SLUG = os.environ.get("MOVIE_SLUG", "the-odyssey-76238")
+# TODO: change to the new theatre's slug (must match THEATRE_URL's theatre).
 THEATRE_SLUG = os.environ.get("THEATRE_SLUG", "amc-lincoln-square-13")
+# TODO: change to the format you want to watch for, e.g. imax70mm, imax, 70mm.
 FORMAT_KEY = os.environ.get("FORMAT_KEY", "imax70mm")  # matches AMC's premium-offering value, e.g. imax70mm, imax, 70mm
+# TODO: cosmetic only - just used in log lines and the notification text.
 MOVIE_DISPLAY_NAME = os.environ.get("MOVIE_DISPLAY_NAME", "The Odyssey")
+# TODO: cosmetic only - just used in log lines and the notification text.
 FORMAT_DISPLAY_NAME = os.environ.get("FORMAT_DISPLAY_NAME", "IMAX 70mm")
 
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "45"))
@@ -155,6 +176,15 @@ def check_availability(html):
     the page's embedded Next.js hydration/flight-data blob (which contains
     JSON-escaped `\\"id\\":...` text and can reference a movie/format even when no
     showtimes are actually on sale for this date).
+
+    TODO(watching multiple formats / "any format" instead of one specific format):
+    this function only checks a single MOVIE_SLUG + THEATRE_SLUG + FORMAT_KEY
+    combo. If you want to alert on e.g. "IMAX 70mm OR regular 70mm", change the
+    `marker` line below to check several FORMAT_KEY values (e.g. loop over a
+    list from a new FORMAT_KEYS env var and return available=True if any match),
+    or to alert the instant the movie has *any* showtimes at all, just use the
+    looser `movie_present` check (further below) as your `available` signal
+    instead.
     """
     marker = f'id="{MOVIE_SLUG}-{THEATRE_SLUG}-{FORMAT_KEY}'
     idx = html.find(marker)
