@@ -69,10 +69,13 @@ MOVIE_SLUG = os.environ.get("MOVIE_SLUG", "the-odyssey-76238")
 # TODO: change to the new theatre's slug (must match THEATRE_URL's theatre).
 THEATRE_SLUG = os.environ.get("THEATRE_SLUG", "amc-lincoln-square-13")
 # TODO: change to the format you want to watch for, e.g. imax70mm, imax, 70mm.
+# Leave this empty (FORMAT_KEY=) to instead alert on ANY format for the movie -
+# i.e. the instant it has any showtimes at all, regardless of format.
 FORMAT_KEY = os.environ.get("FORMAT_KEY", "imax70mm")  # matches AMC's premium-offering value, e.g. imax70mm, imax, 70mm
 # TODO: cosmetic only - just used in log lines and the notification text.
 MOVIE_DISPLAY_NAME = os.environ.get("MOVIE_DISPLAY_NAME", "The Odyssey")
-# TODO: cosmetic only - just used in log lines and the notification text.
+# TODO: cosmetic only - just used in log lines and the notification text. Only
+# matters if FORMAT_KEY is set; ignored in "any format" mode.
 FORMAT_DISPLAY_NAME = os.environ.get("FORMAT_DISPLAY_NAME", "IMAX 70mm")
 
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "45"))
@@ -177,16 +180,21 @@ def check_availability(html):
     JSON-escaped `\\"id\\":...` text and can reference a movie/format even when no
     showtimes are actually on sale for this date).
 
-    TODO(watching multiple formats / "any format" instead of one specific format):
-    this function only checks a single MOVIE_SLUG + THEATRE_SLUG + FORMAT_KEY
-    combo. If you want to alert on e.g. "IMAX 70mm OR regular 70mm", change the
-    `marker` line below to check several FORMAT_KEY values (e.g. loop over a
-    list from a new FORMAT_KEYS env var and return available=True if any match),
-    or to alert the instant the movie has *any* showtimes at all, just use the
-    looser `movie_present` check (further below) as your `available` signal
-    instead.
+    If FORMAT_KEY is left blank (env var unset/empty), "any format" mode kicks
+    in: `available` fires the instant the movie has *any* showtimes at all for
+    this theatre+date, regardless of format.
+
+    TODO(watching multiple *specific* formats, e.g. "IMAX 70mm OR Dolby" but not
+    plain standard showings): change the `marker` line below to check a list of
+    FORMAT_KEY values (e.g. from a new comma-separated FORMAT_KEYS env var) and
+    set available=True if any of them match.
     """
-    marker = f'id="{MOVIE_SLUG}-{THEATRE_SLUG}-{FORMAT_KEY}'
+    any_format = FORMAT_KEY == ""
+    marker = (
+        f'id="{MOVIE_SLUG}-{THEATRE_SLUG}'
+        if any_format
+        else f'id="{MOVIE_SLUG}-{THEATRE_SLUG}-{FORMAT_KEY}'
+    )
     idx = html.find(marker)
     available = idx != -1
     times, almost_full = ([], 0)
@@ -239,12 +247,17 @@ def send_notification(subject, body):
 # Main loop
 # --------------------------------------------------------------------------
 
+def format_label():
+    return "any format" if FORMAT_KEY == "" else FORMAT_DISPLAY_NAME
+
+
 def build_available_message(result):
     times_str = ", ".join(result["times"]) if result["times"] else "see page for times"
     warn = " Some already show Almost Full!" if result["almost_full_count"] else ""
-    subject = f"🎬 {FORMAT_DISPLAY_NAME} tickets for {MOVIE_DISPLAY_NAME} are LIVE!"
+    label = format_label()
+    subject = f"🎬 {MOVIE_DISPLAY_NAME} tickets ({label}) are LIVE!"
     body = (
-        f"{FORMAT_DISPLAY_NAME} tickets for {MOVIE_DISPLAY_NAME} are LIVE at "
+        f"{MOVIE_DISPLAY_NAME} tickets ({label}) are LIVE at "
         f"{THEATRE_SLUG}! Times: {times_str}.{warn} Buy now: {THEATRE_URL}"
     )
     return subject, body
@@ -267,7 +280,7 @@ def run_loop():
 
     state = load_state()
     session = requests.Session()
-    log.info("Watching %s for %s in %s", THEATRE_URL, MOVIE_DISPLAY_NAME, FORMAT_DISPLAY_NAME)
+    log.info("Watching %s for %s in %s", THEATRE_URL, MOVIE_DISPLAY_NAME, format_label())
     log.info(
         "Poll interval: %ss (+/- %ss jitter). Already notified: %s",
         POLL_INTERVAL_SECONDS, POLL_JITTER_SECONDS, state["notified"],

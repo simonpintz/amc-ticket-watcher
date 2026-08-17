@@ -140,6 +140,7 @@ Everything is an env var (see `.env.example`):
 - `POLL_INTERVAL_SECONDS` / `POLL_JITTER_SECONDS` - how often it checks. 45s ± 15s is a reasonable balance of speed vs. not hammering AMC's servers. AMC ticket releases for a specific showtime aren't usually announced to the second, so faster polling mainly helps if you're worried about losing a race to other buyers within the same minute the drop happens - going much below ~20s starts to look bot-like to Cloudflare.
 - `MOVIE_SLUG` / `THEATRE_SLUG` / `FORMAT_KEY` - change these to watch a different movie/theatre/format. You can find them by viewing the page source of any AMC showtimes page with that movie+theatre and searching for `-attributes"`.
 - `FORMAT_KEY` options seen on this page: `imax70mm` (IMAX 70mm), `imax` (IMAX at AMC), `dolbycinemaatamcprime` (Dolby Cinema), `70mm` (plain 70mm, no IMAX).
+- Leave `FORMAT_KEY` blank to switch to "any format" mode - it'll alert the moment the movie has *any* showtimes at all for that theatre+date, regardless of format. Useful if you just want to know the second tickets open at all, not for one specific premium format.
 
 ## Known limitations / risks
 
