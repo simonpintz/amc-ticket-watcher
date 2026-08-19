@@ -81,8 +81,12 @@ MOVIE_DISPLAY_NAME = os.environ.get("MOVIE_DISPLAY_NAME", "The Odyssey")
 # matters if FORMAT_KEY is set; ignored in "any format" mode.
 FORMAT_DISPLAY_NAME = os.environ.get("FORMAT_DISPLAY_NAME", "IMAX 70mm")
 
-POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "45"))
-POLL_JITTER_SECONDS = int(os.environ.get("POLL_JITTER_SECONDS", "15"))
+# Defaults kept conservative (120s +/- up to 60s jitter) to reduce the odds of
+# tripping AMC's bot-check under sustained polling - see BotChallengeError.
+# Speed this up (e.g. 30-45s) only for a short, deliberate window right around
+# a known on-sale time; don't leave it fast for a long unattended run.
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "120"))
+POLL_JITTER_SECONDS = int(os.environ.get("POLL_JITTER_SECONDS", "60"))
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "20"))
 
 RENOTIFY_INTERVAL_SECONDS = int(os.environ.get("RENOTIFY_INTERVAL_SECONDS", "900"))  # 15 min
