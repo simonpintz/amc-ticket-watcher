@@ -13,14 +13,22 @@ bot-checks at checkout - both a security risk and likely to get your account
 flagged or banned. Fast, reliable notification + you clicking "buy" is the
 safe version of this.
 
-Notifications are sent via free Gmail SMTP to your email address, and
-optionally to your phone carrier's free email-to-SMS gateway (e.g.
-`5551234567@txt.att.net`) so it also arrives as a text message, at no cost.
+Notifications are sent via the free [Resend](https://resend.com) HTTPS email
+API to your email address, and optionally to your phone carrier's free
+email-to-SMS gateway (e.g. `5551234567@txt.att.net`, best-effort only - see
+below) so it also arrives as a text message, at no cost.
+
 (We initially tried Twilio, but Twilio recently locked trial accounts down to
 ~10 canned message templates with no custom text/links allowed, and a paid
 Twilio account requires a $20 minimum deposit plus A2P 10DLC business
-registration to reliably deliver to US phones - unnecessary hassle and cost
-for a single personal alert.)
+registration - unnecessary hassle/cost for a single personal alert. We then
+tried Gmail SMTP, which worked locally but **silently failed once deployed**:
+Railway (and most PaaS hosts) block outbound SMTP entirely except on paid/Pro
+plans, to prevent their platform being used for spam. It fails with a raw
+`[Errno 101] Network is unreachable` socket error - nothing wrong with your
+Gmail credentials, the connection is just blocked at the network level and no
+amount of retrying fixes it. Resend's API is plain HTTPS (like any normal web
+request), so it isn't affected by that block.)
 
 ## How detection works
 
@@ -42,9 +50,18 @@ One quirk discovered while building this: AMC's Cloudflare-based traffic
 manager ("Global Safety Net") transparently 302-redirects first-time visitors
 through a `queue.amctheatres.com` token exchange before serving the page. A
 plain `requests.Session()` (which follows redirects and keeps cookies) handles
-this automatically - no special code needed - but if AMC changes this
-behavior and the watcher starts logging fetch failures, that's the first place
-to look.
+this automatically - no special code needed.
+
+A second quirk: under heavier request volume (e.g. rapid-fire repeated
+requests from the same IP), that same traffic manager can instead serve a
+tiny (~2KB) JavaScript-only interstitial that does `document.location.href =
+...` to redirect - something a plain HTTP client can't execute, since it
+doesn't run JS. Without a check for this, that page (which contains no movie
+markers) looks identical to a real "not on sale yet" response, which would
+silently and incorrectly report unavailability. `fetch_page()` detects this
+(response body too small / contains telltale strings) and raises
+`BotChallengeError` instead, which is treated as a fetch failure (retried,
+and eventually raises a failure alert) rather than a false "not available."
 
 ## 1. Run it locally first (recommended)
 
@@ -52,7 +69,7 @@ to look.
 cd amc-ticket-watcher
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
-cp .env.example .env   # then edit .env with your Gmail info
+cp .env.example .env   # then edit .env with your Resend info
 ```
 
 Sanity-check the parser against a date that already has real showtimes
@@ -71,12 +88,12 @@ Now check the real target date - right now this should print `"available": false
 ./venv/bin/python watcher.py --once
 ```
 
-## 2. Set up Gmail notifications (free)
+## 2. Set up Resend notifications (free)
 
-1. Turn on 2-Step Verification on the Google account you'll send from: [myaccount.google.com/security](https://myaccount.google.com/security).
-2. Create an App Password: [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) → choose "Mail" (or "Other" → name it "AMC watcher") → copy the 16-character password it generates.
-3. In `.env`, set `GMAIL_ADDRESS` to that Gmail account and `GMAIL_APP_PASSWORD` to the app password (not your real Gmail password - app passwords are scoped and revocable).
-4. Set `NOTIFY_EMAILS` to a comma-separated list of where alerts should go. Include your real email, and optionally your phone's carrier email-to-SMS gateway address so it also arrives as a text:
+1. Sign up free at [resend.com](https://resend.com) (no credit card, no domain required).
+2. Create an API key: [resend.com/api-keys](https://resend.com/api-keys) → copy the key (starts with `re_`).
+3. In `.env`, set `RESEND_API_KEY` to that key.
+4. Set `NOTIFY_EMAILS` to the email address you signed up to Resend with (**required** - on the free/no-domain sandbox, Resend will only actually deliver to your own account email). You can also add a carrier email-to-SMS gateway address after a comma, but it'll just fail harmlessly (logged, not fatal) unless you later verify your own domain in Resend:
    - AT&T: `NUMBER@txt.att.net`
    - Verizon: `NUMBER@vtext.com`
    - T-Mobile: `NUMBER@tmomail.net`
@@ -88,7 +105,7 @@ Test it end-to-end:
 ./venv/bin/python watcher.py --send-test-email
 ```
 
-You should get an email (and a text, if you added a carrier gateway address) within a few seconds. Don't move on until this works.
+You should get an email within a few seconds. Don't move on until this works.
 
 ## 3. Run it 24/7 in the cloud
 
@@ -107,7 +124,7 @@ small always-on host. Two easy options:
 ```bash
 brew install flyctl   # or see fly.io/docs/hands-on/install-flyctl
 fly launch --no-deploy   # answer prompts, it detects the Dockerfile
-fly secrets set THEATRE_URL="..." GMAIL_ADDRESS="..." GMAIL_APP_PASSWORD="..." NOTIFY_EMAILS="..."
+fly secrets set THEATRE_URL="..." RESEND_API_KEY="..." NOTIFY_EMAILS="..."
 fly deploy
 fly logs
 ```
@@ -144,7 +161,8 @@ Everything is an env var (see `.env.example`):
 
 ## Known limitations / risks
 
-- If AMC changes their page's HTML structure or ID naming, detection can silently break. The watcher already alerts you by email/text if it can't reach the page at all for a while, but it can't detect "the page loaded fine but the format looks different now." Re-run the `--once` sanity check against a live on-sale date occasionally (e.g. weekly) to confirm the parser still works.
-- Carrier email-to-SMS gateways are not as reliable as a real SMS API - occasionally delayed or filtered as spam. The real email address in `NOTIFY_EMAILS` is your reliable fallback.
-- Polling from a cloud server IP (rather than a residential IP) is generally more likely to draw Cloudflare/bot-management scrutiny over time than requests from your home connection, even though it worked fine in testing here. If you start seeing repeated fetch failures/timeouts in the logs, try increasing `POLL_INTERVAL_SECONDS` first.
+- If AMC changes their page's HTML structure or ID naming, detection can silently break. The watcher already alerts you by email if it can't reach the page at all for a while, but it can't detect "the page loaded fine but the format looks different now." Re-run the `--once` sanity check against a live on-sale date occasionally (e.g. weekly) to confirm the parser still works.
+- Carrier email-to-SMS gateways aren't reliable to begin with, and on Resend's free sandbox they won't deliver at all (403, since they're not your account's own address) unless you verify a custom domain in Resend. The real email address in `NOTIFY_EMAILS` is what actually matters.
+- Polling from a cloud server IP (rather than a residential IP) is generally more likely to draw Cloudflare/bot-management scrutiny over time than requests from your home connection. In testing, a burst of several rapid requests from one IP in a short window was enough to trigger a JS-only bot-check interstitial instead of the real page (see "second quirk" above) - the watcher detects and treats this as a failure rather than a false "not available," but if you see repeated `BotChallengeError`/fetch-failure logs, try increasing `POLL_INTERVAL_SECONDS` first.
 - This is for personal use to avoid missing an on-sale moment - please don't turn this into a resale/scalping tool.
+- **If you change env vars on Railway (e.g. switching from Gmail to Resend), you must redeploy** for them to take effect - just saving the Variables tab doesn't restart the running container.

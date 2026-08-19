@@ -2,11 +2,16 @@
 """
 AMC ticket-drop watcher.
 
-Polls a public AMC showtimes page and emails/texts you the moment a specific
-movie + premium format (e.g. "The Odyssey" in IMAX 70mm) shows up with
-bookable showtimes. Notifications are sent via Gmail SMTP - to your real email
-address, and optionally to your phone's free carrier email-to-SMS gateway
-(e.g. 5551234567@txt.att.net) so it also arrives as a text, at no cost.
+Polls a public AMC showtimes page and emails you the moment a specific movie +
+premium format (e.g. "The Odyssey" in IMAX 70mm) shows up with bookable
+showtimes. Notifications are sent via the Resend HTTPS email API (free tier,
+no domain needed since we only ever email your own Resend account address).
+
+Note: we originally used Gmail SMTP, but most PaaS hosts (Railway included)
+block outbound SMTP entirely on non-Pro plans to prevent spam abuse - it fails
+with a raw "[Errno 101] Network is unreachable" socket error with no way to
+fix it from application code. Resend's API is plain HTTPS, which isn't
+blocked.
 
 This ONLY reads the public showtimes page - it does not log in, does not touch
 checkout/payment, and does not attempt to purchase tickets. See README.md for
@@ -15,7 +20,7 @@ context on why (AMC's Terms of Use prohibit automated purchasing).
 Usage:
     python watcher.py                   # run the poller loop forever
     python watcher.py --once            # check one time and print the result, then exit
-    python watcher.py --send-test-email # send a test notification to confirm SMTP is wired up
+    python watcher.py --send-test-email # send a test notification to confirm Resend is wired up
 
 Configuration is done via environment variables - see .env.example.
 """
@@ -27,9 +32,7 @@ import json
 import time
 import random
 import logging
-import smtplib
 import argparse
-from email.mime.text import MIMEText
 from datetime import datetime, timezone
 
 import requests
@@ -90,14 +93,16 @@ FAILURE_ALERT_COOLDOWN_SECONDS = int(os.environ.get("FAILURE_ALERT_COOLDOWN_SECO
 
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 
-# --- Notifications (Gmail SMTP) ---
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
-GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
-# Comma-separated list of destination addresses. Include both a real email and
-# a carrier email-to-SMS gateway address (e.g. 6507399807@txt.att.net) to get
-# a free text-like alert alongside the email.
+# --- Notifications (Resend HTTPS API) ---
+# Get a free API key at resend.com (no credit card, no domain needed) and put
+# it here. On the free/no-domain sandbox, Resend only allows sending to the
+# email address you signed up with - see README for details.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+RESEND_FROM = os.environ.get("RESEND_FROM", "AMC Watcher <onboarding@resend.dev>")
+# Comma-separated list of destination addresses. On Resend's free sandbox
+# domain, only your own account email will actually deliver - any others
+# (e.g. a carrier email-to-SMS gateway) will just log a failed attempt and be
+# skipped, which is harmless.
 NOTIFY_EMAILS = [
     e.strip() for e in os.environ.get("NOTIFY_EMAILS", "").split(",") if e.strip()
 ]
@@ -148,6 +153,12 @@ def save_state(state):
 # Fetching + parsing the AMC showtimes page
 # --------------------------------------------------------------------------
 
+class BotChallengeError(Exception):
+    """Raised when AMC serves a JS-only bot-check/interstitial page instead of
+    the real showtimes page, so callers don't mistake "couldn't check" for a
+    real "not available" reading."""
+
+
 def fetch_page(session):
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
@@ -156,7 +167,20 @@ def fetch_page(session):
     }
     resp = session.get(THEATRE_URL, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
     resp.raise_for_status()
-    return resp.text
+    html = resp.text
+
+    # AMC's Cloudflare/Queue-it "Global Safety Net" layer can serve a tiny
+    # JS-only interstitial (a `document.location.href = ...` redirect our
+    # plain HTTP client can't execute) instead of the real page - this seems
+    # more likely to happen under heavy load, e.g. right when a hyped movie's
+    # tickets go on sale, which is exactly when we most need this to work.
+    # A real showtimes page is hundreds of KB; the interstitial is ~2-3KB, so
+    # size plus a couple of telltale strings makes a solid, cheap check.
+    if len(html) < 20_000 or "globalsafetynetweb" in html or "requires JavaScript to be enabled" in html:
+        raise BotChallengeError(
+            f"Got a bot-check/interstitial page instead of real content ({len(html)} bytes)"
+        )
+    return html
 
 
 def extract_times_near(html, idx, window=9000):
@@ -215,32 +239,45 @@ def check_availability(html):
 
 
 # --------------------------------------------------------------------------
-# Notifications via Gmail SMTP (also reaches carrier email-to-SMS gateways)
+# Notifications via the Resend HTTPS API
 # --------------------------------------------------------------------------
 
+def _send_one_email(to_addr, subject, body):
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+                json={"from": RESEND_FROM, "to": [to_addr], "subject": subject, "text": body},
+                timeout=15,
+            )
+            if resp.status_code in (200, 201):
+                log.info("Notification sent to %s: %s", to_addr, subject)
+                return True
+            # Don't retry 4xx errors (e.g. sandbox-domain 403 for non-owner
+            # addresses like a carrier gateway) - they'll never succeed.
+            log.error("Resend error %s for %s: %s", resp.status_code, to_addr, resp.text[:300])
+            if 400 <= resp.status_code < 500:
+                return False
+        except requests.RequestException as e:
+            log.error("Resend request failed for %s (attempt %d): %s", to_addr, attempt + 1, e)
+        time.sleep(2 * (attempt + 1))
+    return False
+
+
 def send_notification(subject, body):
-    if not all([GMAIL_ADDRESS, GMAIL_APP_PASSWORD]) or not NOTIFY_EMAILS:
+    if not RESEND_API_KEY or not NOTIFY_EMAILS:
         log.error(
-            "Email is not fully configured - cannot send notification. Subject was: %s", subject
+            "Resend is not fully configured - cannot send notification. Subject was: %s", subject
         )
         return False
 
-    for attempt in range(3):
-        try:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-                server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-                for to_addr in NOTIFY_EMAILS:
-                    msg = MIMEText(body)
-                    msg["Subject"] = subject
-                    msg["From"] = GMAIL_ADDRESS
-                    msg["To"] = to_addr
-                    server.sendmail(GMAIL_ADDRESS, [to_addr], msg.as_string())
-            log.info("Notification sent to %s: %s", NOTIFY_EMAILS, subject)
-            return True
-        except (smtplib.SMTPException, OSError) as e:
-            log.error("SMTP send failed (attempt %d): %s", attempt + 1, e)
-        time.sleep(2 * (attempt + 1))
-    return False
+    # Send independently to each address (list comprehension, not a generator,
+    # so `any()` doesn't short-circuit and skip later addresses) so one failing
+    # (e.g. a carrier email-to-SMS gateway address, which the free Resend
+    # sandbox rejects) doesn't block the others. Success = at least one sent.
+    results = [_send_one_email(addr, subject, body) for addr in NOTIFY_EMAILS]
+    return any(results)
 
 
 # --------------------------------------------------------------------------
@@ -272,7 +309,7 @@ def run_once():
 
 
 def run_loop():
-    if not all([GMAIL_ADDRESS, GMAIL_APP_PASSWORD]) or not NOTIFY_EMAILS:
+    if not RESEND_API_KEY or not NOTIFY_EMAILS:
         log.warning(
             "Email env vars are not fully set - the watcher will run and log status, "
             "but will NOT be able to send notifications until configured."
@@ -321,7 +358,7 @@ def run_loop():
                 )
                 log.info("Not available (%s)", status)
 
-        except requests.RequestException as e:
+        except (requests.RequestException, BotChallengeError) as e:
             state["consecutive_failures"] += 1
             log.error("Fetch failed (%d consecutive): %s", state["consecutive_failures"], e)
             if (
